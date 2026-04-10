@@ -17,4 +17,7 @@ def search_documents(user_id: str, query: str) -> list:
         "user_id_input": user_id,
         "match_count": 3
     }).execute()
-    return result.data
+    
+    # CHANGED — only return results above similarity threshold
+    filtered = [r for r in result.data if r["similarity"] > 0.3]
+    return filtered

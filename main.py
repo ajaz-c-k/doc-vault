@@ -58,7 +58,10 @@ async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     embedding = embed(label + " " + ocr_text)
     save_document(user_id, label, file_url, file_type, ocr_text, embedding)
 
-    os.unlink(file_path)
+    try:
+        os.unlink(file_path)  # CHANGED — safe delete, won't crash if locked on Windows
+    except Exception:
+        pass
     await update.message.reply_text(f"✅ '{label}' stored successfully!")
 
 
@@ -88,6 +91,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.close()  # CHANGED — close handle immediately so Windows doesn't lock it
     await file.download_to_drive(tmp.name, read_timeout=60)
 
     context.user_data["file_path"] = tmp.name
