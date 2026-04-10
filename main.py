@@ -11,8 +11,9 @@ from telegram.ext import (
     filters,
     ConversationHandler,
 )
+from telegram.request import HTTPXRequest
 
-# Import custom modules
+# Custom modules
 from ocr import extract_text
 from storage import upload_file, save_document, supabase
 from embeddings import embed, search_documents
@@ -21,7 +22,6 @@ from embeddings import embed, search_documents
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# Conversation state
 WAITING_LABEL = 1
 
 
@@ -30,6 +30,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to DocVault!\n\n"
         "📤 Send any document or image\n"
+        "💡 Add a caption to auto-label it\n"
         "🔍 Use /find <query>\n"
         "📋 Use /list"
     )
@@ -41,8 +42,24 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start - Start bot\n"
         "/find <text> - Search docs\n"
         "/list - Show all docs\n"
-        "Send file/photo to store"
+        "Send file/photo to store\n"
+        "Tip: Add a caption to skip labeling!"
     )
+
+
+# ---------------- SHARED SAVE LOGIC ----------------
+async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, label: str):
+    file_path = context.user_data["file_path"]
+    file_type = context.user_data["file_type"]
+    user_id = str(update.effective_user.id)
+
+    ocr_text = extract_text(file_path, file_type)
+    file_url = upload_file(file_path, user_id, label)
+    embedding = embed(label + " " + ocr_text)
+    save_document(user_id, label, file_url, file_type, ocr_text, embedding)
+
+    os.unlink(file_path)
+    await update.message.reply_text(f"✅ '{label}' stored successfully!")
 
 
 # ---------------- RECEIVE FILE ----------------
@@ -50,51 +67,48 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
 
     if msg.photo:
-        file = await msg.photo[-1].get_file()
+        file = await context.bot.get_file(
+            msg.photo[-1].file_id,
+            read_timeout=60,
+            write_timeout=60
+        )
         file_type = "image"
+        suffix = ".jpg"
+
     elif msg.document:
-        file = await msg.document.get_file()
+        file = await context.bot.get_file(
+            msg.document.file_id,
+            read_timeout=60,
+            write_timeout=60
+        )
         file_type = "pdf" if msg.document.mime_type == "application/pdf" else "file"
+        suffix = ".pdf" if file_type == "pdf" else ".jpg"
+
     else:
         return
 
-    suffix = ".pdf" if file_type == "pdf" else ".jpg"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-
-    await file.download_to_drive(tmp.name)
+    await file.download_to_drive(tmp.name, read_timeout=60)
 
     context.user_data["file_path"] = tmp.name
     context.user_data["file_type"] = file_type
 
-    await update.message.reply_text("✅ Got it! Send label for this file:")
+    # CHANGED — if caption exists, use it as label directly, skip asking
+    if msg.caption and msg.caption.strip():
+        label = msg.caption.strip()
+        await update.message.reply_text("⏳ Processing...")
+        await process_and_save(update, context, label)
+        return ConversationHandler.END  # CHANGED — skip label step entirely
+
+    await update.message.reply_text("✅ Got it! What should I label this file?")
     return WAITING_LABEL
 
 
 # ---------------- RECEIVE LABEL ----------------
 async def receive_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = update.message.text.strip()
-    file_path = context.user_data["file_path"]
-    file_type = context.user_data["file_type"]
-    user_id = str(update.effective_user.id)
-
     await update.message.reply_text("⏳ Processing...")
-
-    # OCR
-    ocr_text = extract_text(file_path, file_type)
-
-    # Upload
-    file_url = upload_file(file_path, user_id, label)
-
-    # Embedding
-    embedding = embed(label + " " + ocr_text)
-
-    # Save to DB
-    save_document(user_id, label, file_url, file_type, ocr_text, embedding)
-
-    # Delete temp file
-    os.unlink(file_path)
-
-    await update.message.reply_text(f"✅ '{label}' stored successfully!")
+    await process_and_save(update, context, label)
     return ConversationHandler.END
 
 
@@ -103,7 +117,7 @@ async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = " ".join(context.args)
 
     if not query:
-        await update.message.reply_text("Usage: /find <query>")
+        await update.message.reply_text("Usage: /find <what you're looking for>")
         return
 
     results = search_documents(str(update.effective_user.id), query)
@@ -114,16 +128,16 @@ async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for doc in results:
         await update.message.reply_text(
-            f"📄 *{doc['label']}*\n🔗 {doc['file_url']}",
-            parse_mode="Markdown"
+            f"📄 {doc['label']}\n🔗 {doc['file_url']}"
         )
 
 
 # ---------------- LIST ----------------
 async def list_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = supabase.table("documents")\
-        .select("label")\
+        .select("label, created_at")\
         .eq("user_id", str(update.effective_user.id))\
+        .order("created_at", desc=True)\
         .execute()
 
     if not result.data:
@@ -136,9 +150,14 @@ async def list_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- MAIN ----------------
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    request = HTTPXRequest(
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=60
+    )
 
-    # Conversation flow
+    app = ApplicationBuilder().token(TOKEN).request(request).build()
+
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.PHOTO | filters.Document.ALL, receive_file)
@@ -151,7 +170,6 @@ def main():
         fallbacks=[],
     )
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("find", find_doc))
