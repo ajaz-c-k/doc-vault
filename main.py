@@ -23,27 +23,35 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 WAITING_LABEL = 1
+WAITING_DELETE = 2
 
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to DocVault!\n\n"
-        "📤 Send any document or image\n"
-        "💡 Add a caption to auto-label it\n"
-        "🔍 Use /find <query>\n"
-        "📋 Use /list"
+        "Store and retrieve your important documents anytime, anywhere.\n\n"
+        "📤 Send any document or photo to store it\n"
+        "💡 Add a caption while sending to auto-label\n"
+        "🔍 /find <name> — search your documents\n"
+        "📋 /list — see all stored documents\n"
+        "🗑️ /delete — remove a document\n"
+        "❓ /help — show commands\n\n"
+        "Built by Ajaz ⚡"
     )
 
 
 # ---------------- HELP ----------------
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "/start - Start bot\n"
-        "/find <text> - Search docs\n"
-        "/list - Show all docs\n"
-        "Send file/photo to store\n"
-        "Tip: Add a caption to skip labeling!"
+        "📖 DocVault Commands\n\n"
+        "📤 Send file/photo — store a document\n"
+        "💡 Send with caption — auto-labels it\n"
+        "🔍 /find <text> — search your docs\n"
+        "📋 /list — show all your documents\n"
+        "🗑️ /delete — pick from list to delete\n"
+        "🗑️ /delete <name> — delete by name\n\n"
+        "Built by Ajaz ⚡"
     )
 
 
@@ -59,7 +67,7 @@ async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     save_document(user_id, label, file_url, file_type, ocr_text, embedding)
 
     try:
-        os.unlink(file_path)  # CHANGED — safe delete, won't crash if locked on Windows
+        os.unlink(file_path)
     except Exception:
         pass
     await update.message.reply_text(f"✅ '{label}' stored successfully!")
@@ -91,18 +99,17 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-    tmp.close()  # CHANGED — close handle immediately so Windows doesn't lock it
+    tmp.close()
     await file.download_to_drive(tmp.name, read_timeout=60)
 
     context.user_data["file_path"] = tmp.name
     context.user_data["file_type"] = file_type
 
-    # CHANGED — if caption exists, use it as label directly, skip asking
     if msg.caption and msg.caption.strip():
         label = msg.caption.strip()
         await update.message.reply_text("⏳ Processing...")
         await process_and_save(update, context, label)
-        return ConversationHandler.END  # CHANGED — skip label step entirely
+        return ConversationHandler.END
 
     await update.message.reply_text("✅ Got it! What should I label this file?")
     return WAITING_LABEL
@@ -145,11 +152,72 @@ async def list_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         .execute()
 
     if not result.data:
-        await update.message.reply_text("No documents stored yet.")
+        await update.message.reply_text("No documents stored yet. Send a file to get started!")
         return
 
     lines = [f"📄 {d['label']}" for d in result.data]
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text(
+        f"📋 Your Documents ({len(lines)} total)\n\n" + "\n".join(lines)
+    )
+
+
+# ---------------- DELETE ----------------
+async def delete_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+
+    if context.args:
+        label = " ".join(context.args)
+        result = supabase.table("documents")\
+            .select("id, label")\
+            .eq("user_id", user_id)\
+            .ilike("label", f"%{label}%")\
+            .execute()
+
+        if not result.data:
+            await update.message.reply_text(f"❌ No document found matching '{label}'")
+            return ConversationHandler.END
+
+        doc = result.data[0]
+        supabase.table("documents").delete().eq("id", doc["id"]).execute()
+        await update.message.reply_text(f"🗑️ '{doc['label']}' deleted successfully!")
+        return ConversationHandler.END
+
+    result = supabase.table("documents")\
+        .select("id, label")\
+        .eq("user_id", user_id)\
+        .order("created_at", desc=True)\
+        .execute()
+
+    if not result.data:
+        await update.message.reply_text("No documents to delete.")
+        return ConversationHandler.END
+
+    context.user_data["delete_list"] = result.data
+    lines = [f"{i+1}. {d['label']}" for i, d in enumerate(result.data)]
+    await update.message.reply_text(
+        "🗑️ Which document to delete?\nReply with the number:\n\n" + "\n".join(lines)
+    )
+    return WAITING_DELETE
+
+
+# ---------------- CONFIRM DELETE ----------------
+async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        index = int(update.message.text.strip()) - 1
+        docs = context.user_data.get("delete_list", [])
+
+        if index < 0 or index >= len(docs):
+            await update.message.reply_text("❌ Invalid number. Try /delete again.")
+            return ConversationHandler.END
+
+        doc = docs[index]
+        supabase.table("documents").delete().eq("id", doc["id"]).execute()
+        await update.message.reply_text(f"🗑️ '{doc['label']}' deleted successfully!")
+
+    except ValueError:
+        await update.message.reply_text("❌ Please send a valid number. Try /delete again.")
+
+    return ConversationHandler.END
 
 
 # ---------------- MAIN ----------------
@@ -164,11 +232,15 @@ def main():
 
     conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.PHOTO | filters.Document.ALL, receive_file)
+            MessageHandler(filters.PHOTO | filters.Document.ALL, receive_file),
+            CommandHandler("delete", delete_doc),
         ],
         states={
             WAITING_LABEL: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, receive_label)
+            ],
+            WAITING_DELETE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_delete)
             ],
         },
         fallbacks=[],
