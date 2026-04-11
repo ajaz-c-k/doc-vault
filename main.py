@@ -15,7 +15,7 @@ from telegram.request import HTTPXRequest
 
 # Custom modules
 from ocr import extract_text
-from storage import upload_file, save_document, supabase
+from storage import upload_file, save_document, get_signed_url, supabase
 from embeddings import embed, search_documents
 
 # Load env
@@ -37,7 +37,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 /list — see all stored documents\n"
         "🗑️ /delete — remove a document\n"
         "❓ /help — show commands\n\n"
-        "Built by Ajaz "
+        "🔒 Privacy: Files are encrypted. Links expire in 5 mins.\n\n"
+        "Built by Ajaz ⚡"
     )
 
 
@@ -51,7 +52,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 /list — show all your documents\n"
         "🗑️ /delete — pick from list to delete\n"
         "🗑️ /delete <name> — delete by name\n\n"
-        "Built by Ajaz "
+        "🔒 Files encrypted. Links expire in 5 mins.\n\n"
+        "Built by Ajaz ⚡"
     )
 
 
@@ -62,15 +64,18 @@ async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     user_id = str(update.effective_user.id)
 
     ocr_text = extract_text(file_path, file_type)
-    file_url = upload_file(file_path, user_id, label)
+
+    # Upload encrypted — returns storage path not public URL
+    storage_path = upload_file(file_path, user_id, label)
     embedding = embed(label + " " + ocr_text)
-    save_document(user_id, label, file_url, file_type, ocr_text, embedding)
+    save_document(user_id, label, storage_path, file_type, ocr_text, embedding)
 
     try:
         os.unlink(file_path)
     except Exception:
         pass
-    await update.message.reply_text(f"✅ '{label}' stored successfully!")
+
+    await update.message.reply_text(f"✅ '{label}' stored and encrypted! 🔒")
 
 
 # ---------------- RECEIVE FILE ----------------
@@ -107,7 +112,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if msg.caption and msg.caption.strip():
         label = msg.caption.strip()
-        await update.message.reply_text("⏳ Processing...")
+        await update.message.reply_text("⏳ Encrypting and storing...")
         await process_and_save(update, context, label)
         return ConversationHandler.END
 
@@ -118,7 +123,7 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------- RECEIVE LABEL ----------------
 async def receive_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
     label = update.message.text.strip()
-    await update.message.reply_text("⏳ Processing...")
+    await update.message.reply_text("⏳ Encrypting and storing...")
     await process_and_save(update, context, label)
     return ConversationHandler.END
 
@@ -138,8 +143,12 @@ async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for doc in results:
+        # Generate signed URL — expires in 5 minutes
+        signed_url = get_signed_url(doc["file_url"])
         await update.message.reply_text(
-            f"📄 {doc['label']}\n🔗 {doc['file_url']}"
+            f"📄 {doc['label']}\n"
+            f"🔗 {signed_url}\n"
+            f"⏳ Link expires in 5 minutes"
         )
 
 
@@ -168,7 +177,7 @@ async def delete_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.args:
         label = " ".join(context.args)
         result = supabase.table("documents")\
-            .select("id, label")\
+            .select("id, label, file_url")\
             .eq("user_id", user_id)\
             .ilike("label", f"%{label}%")\
             .execute()
@@ -178,12 +187,16 @@ async def delete_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         doc = result.data[0]
+        try:
+            supabase.storage.from_("documents").remove([doc["file_url"]])
+        except Exception:
+            pass
         supabase.table("documents").delete().eq("id", doc["id"]).execute()
         await update.message.reply_text(f"🗑️ '{doc['label']}' deleted successfully!")
         return ConversationHandler.END
 
     result = supabase.table("documents")\
-        .select("id, label")\
+        .select("id, label, file_url")\
         .eq("user_id", user_id)\
         .order("created_at", desc=True)\
         .execute()
@@ -211,6 +224,10 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         doc = docs[index]
+        try:
+            supabase.storage.from_("documents").remove([doc["file_url"]])
+        except Exception:
+            pass
         supabase.table("documents").delete().eq("id", doc["id"]).execute()
         await update.message.reply_text(f"🗑️ '{doc['label']}' deleted successfully!")
 
