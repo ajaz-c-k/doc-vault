@@ -11,13 +11,12 @@ supabase = create_client(
     os.getenv("SUPABASE_SERVICE_KEY")
 )
 
-# Encryption
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
 fernet = Fernet(ENCRYPTION_KEY.encode())
 
 
 def encrypt_file(file_path: str) -> str:
-    """Encrypt file contents and save as .enc file"""
+    """Encrypt file and return path to encrypted version"""
     with open(file_path, "rb") as f:
         encrypted = fernet.encrypt(f.read())
     encrypted_path = file_path + ".enc"
@@ -26,8 +25,13 @@ def encrypt_file(file_path: str) -> str:
     return encrypted_path
 
 
+def decrypt_bytes(encrypted_bytes: bytes) -> bytes:
+    """Decrypt raw bytes back to original file bytes"""
+    return fernet.decrypt(encrypted_bytes)
+
+
 def upload_file(file_path: str, user_id: str, label: str) -> str:
-    """Encrypt file then upload — returns storage path not public URL"""
+    """Encrypt then upload — returns storage path"""
     encrypted_path = encrypt_file(file_path)
     dest = f"{user_id}/{label}_{os.path.basename(file_path)}.enc"
 
@@ -43,20 +47,18 @@ def upload_file(file_path: str, user_id: str, label: str) -> str:
     except Exception:
         pass
 
-    return dest  # return storage path, NOT public URL
+    return dest  # storage path only
 
 
-def get_signed_url(storage_path: str, expires_in: int = 300) -> str:
-    """Generate signed URL that expires in 5 minutes"""
-    result = supabase.storage.from_("documents").create_signed_url(
-        storage_path,
-        expires_in
-    )
-    return result["signedURL"]
+def download_and_decrypt(storage_path: str, output_path: str):
+    """Download encrypted file from storage, decrypt, save to output_path"""
+    encrypted_bytes = supabase.storage.from_("documents").download(storage_path)
+    decrypted_bytes = decrypt_bytes(encrypted_bytes)
+    with open(output_path, "wb") as f:
+        f.write(decrypted_bytes)
 
 
 def save_document(user_id, label, storage_path, file_type, ocr_text, embedding):
-    """Save metadata to DB — stores storage path not public URL"""
     supabase.table("documents").insert({
         "user_id": user_id,
         "label": label,
