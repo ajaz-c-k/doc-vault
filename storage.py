@@ -35,5 +35,5 @@ def save_document(user_id, label, file_url, file_type, ocr_text, embedding):
         "file_url": file_url,
         "file_type": file_type,
         "ocr_text": ocr_text,
-        "embedding": embedding
+        # embedding column skipped — no vector search
     }).execute()
