@@ -37,7 +37,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 /list — see all stored documents\n"
         "🗑️ /delete — remove a document\n"
         "❓ /help — show commands\n\n"
-        "Built by Ajaz ⚡"
+        "Built by Ajaz "
     )
 
 
@@ -51,7 +51,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📋 /list — show all your documents\n"
         "🗑️ /delete — pick from list to delete\n"
         "🗑️ /delete <name> — delete by name\n\n"
-        "Built by Ajaz ⚡"
+        "Built by Ajaz "
     )
 
 
