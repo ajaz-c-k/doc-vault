@@ -29,6 +29,7 @@ WAITING_FIND_NUMBER = 3
 
 # ---------------- START ----------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     await update.message.reply_text(
         "👋 Welcome to DocVault!\n\n"
         "Store and retrieve your important documents anytime, anywhere.\n\n"
@@ -38,10 +39,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 /find <n> — search directly by name\n"
         "📋 /list — see all stored documents\n"
         "🗑️ /delete — remove a document\n"
+        "🔄 /cancel — reset if something is stuck\n"
         "❓ /help — show commands\n\n"
         "🔒 Your files are encrypted at rest.\n\n"
         "Built by Ajaz ⚡"
     )
+    return ConversationHandler.END
 
 
 # ---------------- HELP ----------------
@@ -54,9 +57,18 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 /find <text> — search directly by name\n"
         "📋 /list — show all your documents\n"
         "🗑️ /delete — pick from list to delete\n"
-        "🗑️ /delete <n> — delete by name\n\n"
+        "🗑️ /delete <n> — delete by name\n"
+        "🔄 /cancel — reset stuck state\n\n"
         "Built by Ajaz ⚡"
     )
+
+
+# ---------------- CANCEL ----------------
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    context.chat_data.clear()
+    await update.message.reply_text("🔄 Reset! Try sending a file now.")
+    return ConversationHandler.END
 
 
 # ---------------- SHARED SAVE LOGIC ----------------
@@ -82,16 +94,13 @@ async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, l
 async def send_decrypted_file(update: Update, doc: dict):
     """Download, decrypt and send actual file back to user"""
     storage_path = doc["file_url"]
-    file_type = doc.get("file_type", "file")
     label = doc["label"]
 
-    # Determine suffix from storage path
     if storage_path.endswith(".pdf.enc"):
         suffix = ".pdf"
     else:
         suffix = ".jpg"
 
-    # Download and decrypt to temp file
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.close()
 
@@ -100,7 +109,6 @@ async def send_decrypted_file(update: Update, doc: dict):
     try:
         download_and_decrypt(storage_path, tmp.name)
 
-        # Send actual file back to user
         with open(tmp.name, "rb") as f:
             if suffix == ".pdf":
                 await update.message.reply_document(
@@ -177,7 +185,6 @@ async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     query = " ".join(context.args)
 
-    # /find <name> — search directly
     if query:
         results = search_documents(user_id, query)
         if not results:
@@ -188,7 +195,6 @@ async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_decrypted_file(update, doc)
         return ConversationHandler.END
 
-    # /find only — show numbered list
     result = supabase.table("documents")\
         .select("id, label, file_url, file_type")\
         .eq("user_id", user_id)\
@@ -328,6 +334,8 @@ def main():
             MessageHandler(filters.PHOTO | filters.Document.ALL, receive_file),
             CommandHandler("delete", delete_doc),
             CommandHandler("find", find_doc),
+            CommandHandler("start", start),      # CHANGED — start resets state
+            CommandHandler("cancel", cancel),     # CHANGED — cancel resets state
         ],
         states={
             WAITING_LABEL: [
@@ -340,13 +348,15 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, find_by_number)
             ],
         },
-        fallbacks=[],
+        fallbacks=[
+            CommandHandler("cancel", cancel),     # CHANGED — fallback cancel
+            CommandHandler("start", start),       # CHANGED — fallback start
+        ],
     )
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(conv_handler)
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("list", list_docs))
-    app.add_handler(conv_handler)
 
     print("Bot is running...")
     app.run_polling()
