@@ -24,6 +24,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 WAITING_LABEL = 1
 WAITING_DELETE = 2
+WAITING_FIND_NUMBER = 3
 
 
 # ---------------- START ----------------
@@ -33,7 +34,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Store and retrieve your important documents anytime, anywhere.\n\n"
         "📤 Send any document or photo to store it\n"
         "💡 Add a caption while sending to auto-label\n"
-        "🔍 /find <name> — search your documents\n"
+        "🔍 /find — list all docs, pick by number\n"
+        "🔍 /find <name> — search directly by name\n"
         "📋 /list — see all stored documents\n"
         "🗑️ /delete — remove a document\n"
         "❓ /help — show commands\n\n"
@@ -48,10 +50,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 DocVault Commands\n\n"
         "📤 Send file/photo — store a document\n"
         "💡 Send with caption — auto-labels it\n"
-        "🔍 /find <text> — search your docs\n"
+        "🔍 /find — shows numbered list, reply with number\n"
+        "🔍 /find <text> — search directly by name\n"
         "📋 /list — show all your documents\n"
         "🗑️ /delete — pick from list to delete\n"
-        "🗑️ /delete <name> — delete by name\n\n"
+        "🗑️ /delete <n> — delete by name\n\n"
         "🔒 Files encrypted. Links expire in 5 mins.\n\n"
         "Built by Ajaz ⚡"
     )
@@ -64,8 +67,6 @@ async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     user_id = str(update.effective_user.id)
 
     ocr_text = extract_text(file_path, file_type)
-
-    # Upload encrypted — returns storage path not public URL
     storage_path = upload_file(file_path, user_id, label)
     embedding = embed(label + " " + ocr_text)
     save_document(user_id, label, storage_path, file_type, ocr_text, embedding)
@@ -130,20 +131,57 @@ async def receive_label(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- FIND ----------------
 async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
     query = " ".join(context.args)
 
-    if not query:
-        await update.message.reply_text("Usage: /find <what you're looking for>")
-        return
+    # /find <name> — search directly
+    if query:
+        results = search_documents(user_id, query)
+        if not results:
+            await update.message.reply_text("❌ Nothing found.")
+            return ConversationHandler.END
 
-    results = search_documents(str(update.effective_user.id), query)
+        for doc in results:
+            signed_url = get_signed_url(doc["file_url"])
+            await update.message.reply_text(
+                f"📄 {doc['label']}\n"
+                f"🔗 {signed_url}\n"
+                f"⏳ Link expires in 5 minutes"
+            )
+        return ConversationHandler.END
 
-    if not results:
-        await update.message.reply_text("❌ Nothing found.")
-        return
+    # /find only — show numbered list
+    result = supabase.table("documents")\
+        .select("id, label, file_url")\
+        .eq("user_id", user_id)\
+        .order("label", desc=False)\
+        .execute()
 
-    for doc in results:
-        # Generate signed URL — expires in 5 minutes
+    if not result.data:
+        await update.message.reply_text("No documents stored yet. Send a file to get started!")
+        return ConversationHandler.END
+
+    context.user_data["find_list"] = result.data
+    lines = [f"{i+1}. {d['label']}" for i, d in enumerate(result.data)]
+    await update.message.reply_text(
+        f"📋 Your Documents ({len(lines)} total)\n"
+        f"Reply with a number to retrieve:\n\n" +
+        "\n".join(lines)
+    )
+    return WAITING_FIND_NUMBER
+
+
+# ---------------- FIND BY NUMBER ----------------
+async def find_by_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        index = int(update.message.text.strip()) - 1
+        docs = context.user_data.get("find_list", [])
+
+        if index < 0 or index >= len(docs):
+            await update.message.reply_text("❌ Invalid number. Try /find again.")
+            return ConversationHandler.END
+
+        doc = docs[index]
         signed_url = get_signed_url(doc["file_url"])
         await update.message.reply_text(
             f"📄 {doc['label']}\n"
@@ -151,20 +189,25 @@ async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏳ Link expires in 5 minutes"
         )
 
+    except ValueError:
+        await update.message.reply_text("❌ Please send a valid number. Try /find again.")
+
+    return ConversationHandler.END
+
 
 # ---------------- LIST ----------------
 async def list_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = supabase.table("documents")\
         .select("label, created_at")\
         .eq("user_id", str(update.effective_user.id))\
-        .order("created_at", desc=True)\
+        .order("label", desc=False)\
         .execute()
 
     if not result.data:
         await update.message.reply_text("No documents stored yet. Send a file to get started!")
         return
 
-    lines = [f"📄 {d['label']}" for d in result.data]
+    lines = [f"{i+1}. {d['label']}" for i, d in enumerate(result.data)]
     await update.message.reply_text(
         f"📋 Your Documents ({len(lines)} total)\n\n" + "\n".join(lines)
     )
@@ -198,7 +241,7 @@ async def delete_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = supabase.table("documents")\
         .select("id, label, file_url")\
         .eq("user_id", user_id)\
-        .order("created_at", desc=True)\
+        .order("label", desc=False)\
         .execute()
 
     if not result.data:
@@ -251,6 +294,7 @@ def main():
         entry_points=[
             MessageHandler(filters.PHOTO | filters.Document.ALL, receive_file),
             CommandHandler("delete", delete_doc),
+            CommandHandler("find", find_doc),
         ],
         states={
             WAITING_LABEL: [
@@ -259,13 +303,15 @@ def main():
             WAITING_DELETE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_delete)
             ],
+            WAITING_FIND_NUMBER: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, find_by_number)
+            ],
         },
         fallbacks=[],
     )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("find", find_doc))
     app.add_handler(CommandHandler("list", list_docs))
     app.add_handler(conv_handler)
 
