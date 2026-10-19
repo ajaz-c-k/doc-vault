@@ -1,6 +1,9 @@
 import os
 import tempfile
+import hmac
+from contextlib import asynccontextmanager
 from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request
 
 from telegram import Update
 from telegram.ext import (
@@ -21,6 +24,8 @@ from embeddings import embed, search_documents
 # Load env
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 WAITING_LABEL = 1
 WAITING_DELETE = 2
@@ -209,7 +214,7 @@ async def find_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"{i+1}. {d['label']}" for i, d in enumerate(result.data)]
     await update.message.reply_text(
         f"📋 Your Documents ({len(lines)} total)\n"
-        f"Reply with a number to retrieve:\n\n" +
+        "Reply with a number to retrieve:\n\n" +
         "\n".join(lines)
     )
     return WAITING_FIND_NUMBER
@@ -319,23 +324,26 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# ---------------- MAIN ----------------
-def main():
+# ---------------- BOT SETUP ----------------
+def build_telegram_application():
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN environment variable is required")
+
     request = HTTPXRequest(
         read_timeout=60,
         write_timeout=60,
         connect_timeout=60
     )
 
-    app = ApplicationBuilder().token(TOKEN).request(request).build()
+    telegram_app = ApplicationBuilder().token(TOKEN).request(request).build()
 
     conv_handler = ConversationHandler(
         entry_points=[
             MessageHandler(filters.PHOTO | filters.Document.ALL, receive_file),
             CommandHandler("delete", delete_doc),
             CommandHandler("find", find_doc),
-            CommandHandler("start", start),      # CHANGED — start resets state
-            CommandHandler("cancel", cancel),     # CHANGED — cancel resets state
+            CommandHandler("start", start),
+            CommandHandler("cancel", cancel),
         ],
         states={
             WAITING_LABEL: [
@@ -349,18 +357,75 @@ def main():
             ],
         },
         fallbacks=[
-            CommandHandler("cancel", cancel),     # CHANGED — fallback cancel
-            CommandHandler("start", start),       # CHANGED — fallback start
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
         ],
     )
 
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("list", list_docs))
+    telegram_app.add_handler(conv_handler)
+    telegram_app.add_handler(CommandHandler("help", help_cmd))
+    telegram_app.add_handler(CommandHandler("list", list_docs))
+    return telegram_app
 
-    print("Bot is running...")
-    app.run_polling()
+
+telegram_app = build_telegram_application()
+
+
+@asynccontextmanager
+async def lifespan(_web_app: FastAPI):
+    if not WEBHOOK_SECRET:
+        raise RuntimeError("WEBHOOK_SECRET environment variable is required")
+
+    await telegram_app.initialize()
+    await telegram_app.start()
+    try:
+        # Leave WEBHOOK_URL unset for the first deployment. Once Cloud Run
+        # assigns the public URL, add it and deploy a new revision.
+        if WEBHOOK_URL:
+            await telegram_app.bot.set_webhook(
+                url=f"{WEBHOOK_URL.rstrip('/')}/telegram",
+                secret_token=WEBHOOK_SECRET,
+                allowed_updates=Update.ALL_TYPES,
+            )
+        yield
+    finally:
+        if telegram_app.running:
+            await telegram_app.stop()
+        await telegram_app.shutdown()
+
+
+web_app = FastAPI(lifespan=lifespan)
+
+
+@web_app.get("/")
+async def health_check():
+    return {"status": "ok"}
+
+
+@web_app.post("/telegram")
+async def telegram_webhook(request: Request):
+    if not WEBHOOK_URL:
+        raise HTTPException(status_code=503, detail="Telegram webhook is not configured")
+
+    received_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(received_secret, WEBHOOK_SECRET or ""):
+        raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
+    try:
+        payload = await request.json()
+        update = Update.de_json(payload, telegram_app.bot)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid Telegram update")
+
+    await telegram_app.update_queue.put(update)
+    return {"ok": True}
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+
+    uvicorn.run(
+        web_app,
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8080")),
+    )
