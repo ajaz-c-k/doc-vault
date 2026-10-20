@@ -1,6 +1,9 @@
+import asyncio
+import logging
 import os
 import tempfile
 import hmac
+import time
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -20,6 +23,8 @@ from telegram.request import HTTPXRequest
 from ocr import extract_text
 from storage import upload_file, save_document, download_and_decrypt, supabase
 from embeddings import embed, search_documents
+
+logger = logging.getLogger(__name__)
 
 # Load env
 load_dotenv()
@@ -82,10 +87,20 @@ async def process_and_save(update: Update, context: ContextTypes.DEFAULT_TYPE, l
     file_type = context.user_data["file_type"]
     user_id = str(update.effective_user.id)
 
-    ocr_text = extract_text(file_path, file_type)
-    storage_path = upload_file(file_path, user_id, label)
+    stage_started = time.perf_counter()
+    ocr_text = await asyncio.to_thread(extract_text, file_path, file_type)
+    logger.info("Document OCR completed in %.2f seconds", time.perf_counter() - stage_started)
+
+    stage_started = time.perf_counter()
+    storage_path = await asyncio.to_thread(upload_file, file_path, user_id, label)
+    logger.info("Encrypted document upload completed in %.2f seconds", time.perf_counter() - stage_started)
+
     embedding = embed(label + " " + ocr_text)
-    save_document(user_id, label, storage_path, file_type, ocr_text, embedding)
+    stage_started = time.perf_counter()
+    await asyncio.to_thread(
+        save_document, user_id, label, storage_path, file_type, ocr_text, embedding
+    )
+    logger.info("Document database insert completed in %.2f seconds", time.perf_counter() - stage_started)
 
     try:
         os.unlink(file_path)
@@ -429,3 +444,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=int(os.getenv("PORT", "8080")),
     )
+
