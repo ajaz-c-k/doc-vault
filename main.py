@@ -272,6 +272,13 @@ async def list_docs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------- UNKNOWN MESSAGE GUIDANCE ----------------
+async def unknown_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "I'm not sure what you mean. Send a photo or document to save it, or use /help to see the available commands."
+    )
+
+
 # ---------------- DELETE ----------------
 async def delete_doc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -380,6 +387,7 @@ def build_telegram_application():
     telegram_app.add_handler(conv_handler)
     telegram_app.add_handler(CommandHandler("help", help_cmd))
     telegram_app.add_handler(CommandHandler("list", list_docs))
+    telegram_app.add_handler(MessageHandler(filters.TEXT, unknown_message))
     return telegram_app
 
 
